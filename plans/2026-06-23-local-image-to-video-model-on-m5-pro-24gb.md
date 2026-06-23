@@ -117,6 +117,73 @@
 5. **后处理放大**：720P 终稿用 Real-ESRGAN / Topaz Video AI 放大到 1080P / 1440P，遮盖一部分细节瑕疵。
 6. **如果预算允许升级硬件**：64 GB 内存 Mac Studio 可以跑 **Wan 2.2 I2V-A14B BF16**，画质会从 8.3 → 9.5，这是最大幅度的一次跃迁；24 GB 这台机器没有这个选项。
 
+#### 3.1.2 Wan 2.2 I2V-A14B 运行配置要求（升级路径专题）
+
+A14B 不是"一个 14B 模型"，而是 **MoE 双专家结构（高噪 + 低噪 ≈ 27B 总参数 / 14B 激活）+ UMT5-XXL 9.4 GB 文本编码器**，所以"显存账"要分三块算。下面是按精度 × 是否 offload 的完整门槛。
+
+**A. NVIDIA / CUDA 平台（参考基准）**
+
+| 精度 | 文本编码器位置 | 480P 显存 | 720P 显存 | 最低可用 GPU | 备注 |
+| --- | --- | --- | --- | --- | --- |
+| FP16 满精度 | GPU | ~45–55 GB | **~54–65 GB** | A100 80GB / H100 / 多卡 | 数据中心档，桌面买不到 |
+| FP16 满精度 | CPU offload T5 | ~36–45 GB | ~45–55 GB | RTX 6000 Ada 48 GB / A6000 48GB | 工作站档 |
+| FP8 | GPU | ~18–22 GB | **~22–26 GB** | **RTX 4090 / 5090 24 GB**（紧） | FP8 在 Mac 上**不可用** |
+| FP8 | CPU offload T5 | ~12–14 GB | ~14–16 GB | RTX 4080 Super 16GB | 主流甜点档 |
+| GGUF Q5 | CPU offload T5 | ~6–8 GB | ~8–10 GB | RTX 4070 / 3060 12GB | 质量略降，速度更慢 |
+| GGUF Q4_K_S | CPU offload T5 | ~5–7 GB | ~7–9 GB | RTX 4060 Ti 16GB / 3060 12GB | 加 BlockSwap 后 8 GB 卡也能跑 |
+| GGUF Q4 + BlockSwap(20 blocks) | CPU offload T5 | — | **~5.5 GB** | RTX 3060 12GB（720P） | 极限省显存档，速度大幅下降 |
+
+附加硬件要求（全平台通用）：
+
+- **系统内存 ≥ 32 GB**（推荐 64 GB）。T5-XXL 9.4 GB 一旦 offload 就长期驻留系统内存，加上扩散主干在切换时的 swap 缓冲，16 GB 系统内存会触发 swap，速度从分钟级跌到小时级。
+- **磁盘 ≥ 60 GB 自由空间**：FP16 两份专家 ×27 GB = 54 GB + VAE + 文本编码器。
+- **CUDA ≥ 11.8 / PyTorch ≥ 2.0**（NVIDIA）。
+
+**B. Apple Silicon / macOS 平台（这才是你这台机器关心的）**
+
+关键事实：
+
+1. **FP8 在 MPS 后端不支持**（`Float8_e4m3fn` 无法转 MPS，社区 issue #9255 已确认），所以 NVIDIA 上"FP8 + 24 GB"那档**在 Mac 上不存在**。
+2. 唯一可行路径是 **BF16 / FP16 全精度** 或 **GGUF Q4–Q8 量化**，且两份专家不能同时在 GPU。
+3. 已有 **`antonpetrovmain/Wan2.2-mlx`** 这个 MLX 原生移植，绕开 PyTorch + MPS 的算子坑，能更高效利用统一内存。
+4. **ComfyUI 官方 Wan 2.2 14B 模板在 macOS 上目前直接跑不起来**（默认就是 FP8），必须改用 GGUF + `UnetLoaderGGUF`。
+
+| Mac 配置 | 能跑哪个档位的 14B I2V | 现实可用度 |
+| --- | --- | --- |
+| **M5 Pro / 24 GB**（你这台） | 仅 **GGUF Q3/Q4** + 极限 BlockSwap，或 MLX 4-bit 量化 | ❌ **不推荐**：显存峰值贴着上限，VAE 解码段易 OOM；速度极慢；质量大幅打折后就和 5B 接近，失去意义 |
+| M3/M4 Max 64 GB | **GGUF Q4_K_S / Q5_K_M**（推荐）；FP16 单专家轮换勉强 | ⚠️ **可用但慢**：M1 Max 64 GB 实测 GGUF Q4_K_S **82 分钟 / 2 秒视频** —— M5 Pro 同档预计 50–70 分钟 |
+| **M3 Ultra / M4 Max 128 GB** | **FP16 全精度** 也可装下（VAE + T5 + 双专家 ≈ 54 GB） | ✅ **舒服**：无需量化，质量接近 NVIDIA H100 输出 |
+| Mac Studio M3 Ultra 192 GB | FP16 + 长帧数 + LoRA 一起开 | ✅ **理想**：是当前 Apple 平台跑 14B 的最佳机型 |
+
+**速度参考（同分辨率 / 帧数）**
+
+| 硬件 | 模型档位 | 5s @ 720P 单段耗时 |
+| --- | --- | --- |
+| RTX 4090 24GB | FP8 + T5 offload | ~25–35 min |
+| RTX 4070 12GB | GGUF Q5 + offload | ~50–70 min |
+| **M1 Max 64GB**（实测） | GGUF Q4_K_S | **~205 min**（按 82 min / 2s 线性外推） |
+| **M5 Pro 24GB**（预测） | GGUF Q3，能跑则跑 | **预计 250–350 min**，且极易 OOM |
+| Mac Studio M3 Ultra 128GB | MLX FP16 | ~80–110 min（社区报告） |
+
+**结论：在你这台 M5 Pro / 24 GB 上，强行跑 Wan 2.2 I2V-A14B 是"技术上勉强 + 工程上不可行"**：
+
+- 要靠 GGUF Q3/Q4 + BlockSwap 把显存压到 ~7 GB，但 Mac 上的 GGUF + MPS 组合还有 dtype cast、VAE decode NaN 等已知 bug；
+- 即使跑通，单段视频 4–6 小时，质量已被量化吃掉一截，**最终画质大概率劣于直接用 TI2V-5B BF16**；
+- 工程化（异步队列 + 并发 + 任务取消）几乎无法做。
+
+**升级路径（按"画质提升 / 美元"排序）**
+
+| 选项 | 大致预算 | 能解锁的能力 |
+| --- | --- | --- |
+| 不升级，沿用 M5 Pro 24 GB + TI2V-5B | 0 | 画质 8.3，单段 25–45 min |
+| **Mac Studio M4 Max 64 GB** | ~3 万元起 | **14B GGUF Q4/Q5 可用**，画质 9.0–9.3，单段 ~60 min |
+| **Mac Studio M3/M4 Ultra 128 GB** | ~5 万元起 | **14B FP16 舒服跑**，画质 9.5，单段 ~80–110 min |
+| 单卡 RTX 4090 24GB 工作站（Linux/Win） | ~2.5–3.5 万元 | **14B FP8 主流方案**，单段 25–35 min，生态最完善 |
+| 单卡 RTX 5090 32GB 工作站 | ~4–5 万元 | 14B FP8 余量充足，可叠 LoRA / 多镜头 |
+| 双 RTX 5090 / H100 80GB | ≥ 10 万元 | FP16 满精度 + 大规模批处理 |
+
+> 对你这个"本地、可商用、性价比"的目标，性价比最高的两个选项是 **Mac Studio M4 Max 64 GB** 或 **RTX 4090 24GB Linux 工作站**。前者是无缝从你当前生态延展，后者是开源视频模型的"出厂适配"平台。
+
 - **风险点**：
   - 单次推理时长长（M5 Pro 实测预估：480P × 49 帧 ≈ 10–18 分钟/段，720P × 5s ≈ 25–45 分钟/段）。需要做预设、批处理与冷启动缓存。
   - VAE 解码是显存峰值，需要启用 ComfyUI 的 `--fp16-intermediates` 与 tiled VAE。

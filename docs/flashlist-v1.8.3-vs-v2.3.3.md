@@ -279,31 +279,115 @@ V1 Android `AutoLayoutView.dispatchDraw` → `clearGapsAndOverlaps`；同时算 
 
 ---
 
-## 7. 场景选型：10 种卡片 + 同 type 内图片高度不齐
+## 7. 严谨场景分析：同 type 高度不齐 +「JS 精确预高」是否让 V1 更优
 
-### 现象对齐（实现层）
+### 7.1 体感对齐到版本（按机制）
 
-| 体感 | 更吻合的版本 | 底层原因 |
+| 体感 | 对齐版本 | 源码机制 |
 |---|---|---|
-| 快滑流畅，但虚白 / 整屏白 | **V1** | 靠 `estimatedItemSize` + 类型平均高估绝对坐标；同 type 高度方差大时，预渲染窗口算不准 → blank；滚动本身较少被同步测量堵住 |
-| 快滑卡顿、少白屏；列表很长时可能卡死/crash | **V2** | `useLayoutEffect` 里同步 `measureLayout`；图片异步撑开高度 → 反复 `modifyChildrenLayout` / 重渲染；空白少，但 JS 布局风暴会卡甚至拖垮 |
+| 惯性跟手、快滑不堵 JS，但白屏率高 | **V1.8.3** | 滚动期主要靠事先算好的绝对坐标 + 小 `drawDistance` 预挂载；坐标/覆盖算错或挂载跟不上 → blank；**没有**每帧对全部 cell 做同步 `measureLayout` |
+| 快滑明显卡 / 短暂停住、白屏很少；极端时长列表可能卡死 | **V2.3.3** | 每个 layout 周期对 engaged `ViewHolder` 同步 `measureLayout`；尺寸一变就 `modifyChildrenLayout` → `setRenderId`；超过 40 次 render 未 commit 会告警并停止更新（`RenderTimeTracker`） |
 
-`getItemType` **解决不了这个问题**。它只隔离回收池（10 种结构 → 10 个池），**不管高度**。同 type 高度参差是布局/测量问题，不是 type 划分问题。不要按「高度档位」拆 type（池会炸、回收变差）。
+「卡顿反而少白屏」在机制上成立：V2 卡顿把滚速压下来，窗口来得及测完；V1 滚速不降，窗口跑在渲染前面就空。
 
-### 结论：这类业务更该押 **V2**，但有前提
+---
 
-1. **引擎匹配度**：不规则图片流本质是「高度事前不可用单一 estimate 描述」。V2 就是为去掉 estimate、按真实测量排版而重写的；V1 的 blank 在这种数据分布下是结构性的，不是调一下 `estimatedItemSize` 就能根治。
-2. **必须先稳住高度**：接口带上图片宽高或 aspect ratio，cell 用固定比例容器占位，图片加载后**不再改变 cell 高度**。否则：
-   - V1 → 白屏
-   - V2 → 卡顿 / 布局风暴 / crash  
-   两边都不会好。
-3. **若暂时拿不到尺寸**：短期体感上 V1「更跟手」、V2「更正确但更卡」；产品上整屏白通常比偶发卡顿更伤，但 V2 的 crash 不可接受。正确顺序是 **先做高度占位，再上 V2**，而不是在「裸图片撑开」状态下二选一硬扛。
-4. **Old Arch 只能 V1**：那时用 `overrideItemLayout` 尽可能写入已知 size，并把 `estimatedItemSize` 调到接近中位数，接受残余 blank。
+### 7.2 纠正：`getItemType` 在 V1 里主要不是「按 type 求均值」
 
-### 实践清单（V2 优先路径）
+#### V1：`getItemType` → RLV **回收池 type**；高度均值是**全局**一个窗口
 
-- `getItemType` → 按 **10 种卡片结构** 分，不按高度分
-- 图片区：`aspectRatio` / 预知 height，避免 `onLoad` 改布局
-- item 组件 memo；回收用 `useRecyclingState`，禁止 cell 内 `key={item.id}`
-- 长列表仍卡：查图片解码/重布局次数，适当加大 `drawDistance`，避免一次插入过大
-- 只有 New Arch 可用时才上 V2.3.3
+`FlashList.getLayoutProvider`（`v1.8.3/src/FlashList.tsx`）：
+
+1. `getItemType(item)` → RLV layout type（recycle pool 键）
+2. `overrideItemLayout` → 可读 `layout.span` / **`layout.size`**
+3. 高度：`overrideItemLayout` 的 `size`，否则 fallback **`averageItemSize`**
+
+`GridLayoutProviderWithProps`（`v1.8.3/src/GridLayoutProviderWithProps.ts`）：
+
+- 只有 **一个** `AverageWindow`（不是 `Map<itemType, …>`）
+- `reportItemLayout` 把任意 index 的测高丢进**同一个**窗口
+- 种子是 `estimatedItemSize`（默认 100）
+
+因此：`getItemType` 对**回收**极重要；它**并不**在 V1 FlashList 里维护「每 type 平均高度」。同 type 高度方差大时，伤的是 fallback 到全局平均、**没写 `layout.size`** 的项。若对**每一项**写准 `size`，全局平均几乎不参与定位。
+
+#### V2：反而是按 type 的 `MultiTypeAverageWindow`；但**不再读取 size 预测**
+
+`RVLayoutManager`（`v2.3.3/.../LayoutManager.ts`）：
+
+- `MultiTypeAverageWindow(5, 200)`，按 `getItemType` 分桶做未测前 bootstrap
+- 公开 `overrideItemLayout` 类型只有 `{ span?: number }`；`v2-changes.md` 写明 **不再读 size estimates**
+- `SpanSizeInfo` 虽残留 `size?: number`，源码无任何读取——死字段
+
+**「natural 宽高 → JS 精确高度 → 注入布局引擎」这条一等 API，只在 V1 的 `overrideItemLayout.size` 上存在。**
+
+---
+
+### 7.3 V1 白屏因果链（有 / 无精确 size）
+
+V1 写死 `forceNonDeterministicRendering`。RLV `ViewRenderer` 在该模式下：
+
+- cell **不设** height/width，只绝对定位 left/top
+- LayoutManager 用 `size` 或全局平均预先堆叠 `y`
+- `onLayout`：仅当实际宽高 ≠ 布局记录时才 `overrideLayout` + 排队 relayout
+
+官方 `estimated-item-size.md`：estimate **偏大** → 快滑时以为少量 item 够填屏 → **blank**；组件太慢也会 blank。
+
+| 条件 | 结果 |
+|---|---|
+| 只用 `estimatedItemSize` / 全局平均，同 type 图高方差大 | 堆叠 `y` 偏 → engaged 覆盖错 → **白屏** |
+| **每项** `overrideItemLayout` 写入与真实渲染一致的 `size`（含 separator） | 初始 `y` 准 → blank 大降；且少触发 `onSizeChanged` relayout |
+| size 准但 `renderItem` 很重 | 仍可能 blank（挂载跟不上惯性） |
+| size 与真实差几 px | 非确定性 relayout + AutoLayout 挪位 |
+
+**「后端 natural + UI 结构 JS 推算」正好打在 V1 blank 主因上。**
+
+---
+
+### 7.4 V2 卡顿因果链
+
+`RecyclerView.tsx` 每个 `useLayoutEffect`：对全部 engaged ViewHolder 同步 `measureItemLayout` → `modifyChildrenLayout` → 变则 `setRenderId`，否则 commit + MVCP。
+
+- 图片先矮后撑 → 反复 measure/relayout → 卡；连续 40 次未 commit → 停止更新（像卡死）
+- 即使业务层把算出的 height 写死在 cell 根上，V2 **仍**每轮同步测量 engaged 集合；只是不再高度风暴
+- V2 **无法**把 JS 预高写进 layout manager 替代测量
+
+---
+
+### 7.5 结论：精确 JS 预高后，V1 是否更好？
+
+**在你能把预高做到与真实渲染一致的前提下：是。V1 是这条策略的对口引擎；V2 关掉了 size 注入。**
+
+1. API：V1 有 `size`；V2 文档与类型明确不读 size  
+2. 滚动热路径：V1 准 size 后主要是换池 + 渲染；V2 多全量 engaged 同步 measure  
+3. blank 主因（预堆叠偏大）可被逐项 `size` 消灭  
+4. `getItemType` 两边都要（结构分池）；不要误当成 V1 的「每 type 均值」——V1 均值是全局的；精确路径应逐项写 `size` 绕过它  
+5. V2 的 per-type 均值只是无估计时的 bootstrap，替补不了你的 JS 模型  
+
+### 7.6 预高必须满足的条件
+
+1. 每个 index 写 `layout.size`（竖列表=高度）  
+2. 算式覆盖：图区比例、模块显隐、padding/border、**separator**  
+3. Image 按同一公式占位，禁止 `onLoad` 再改高  
+4. `overrideItemLayout` 必须快  
+5. `getItemType` 按 10 种**结构**，不按高度档  
+6. render 仍慢则加大 `drawDistance` 只能缓解  
+
+### 7.7 决策表（修订）
+
+| 能力 | 选择 |
+|---|---|
+| 能拿到 natural 尺寸且 JS 高度≈真实 UI | **V1.8.3 + 逐项 `overrideItemLayout.size` + 结构 `getItemType`** |
+| 推算经常不准 | V1 白屏 / V2 卡顿都会出现——先修占位 |
+| 必须用 V2（MVCP/masonry/无原生等） | cell 根写死算出的 height；接受同步 measure；props memo |
+
+### 7.8 V1 精确预高清单
+
+```ts
+overrideItemLayout={(layout, item) => {
+  layout.size = computeCardHeight(item, listWidth); // 含图比例 + 显隐 + separator
+}}
+getItemType={(item) => item.cardType} // 10 种结构
+estimatedItemSize={medianOrSlightlySmall} // 仅兜底；目标很少走到
+```
+
+用 element inspector 对比 `computeCardHeight`；偏差趋近 0 时，快滑 blank 应显著下降，并保持 V1 跟手惯性。

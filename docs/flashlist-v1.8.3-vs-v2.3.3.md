@@ -276,3 +276,34 @@ V1 Android `AutoLayoutView.dispatchDraw` → `clearGapsAndOverlaps`；同时算 
 6. **从 V1 迁移**：删 estimate、Masonry API、AutoLayout/CellContainer 相关代码路径  
 
 本地缓存已就绪，后续可以直接点名文件/类继续挖。
+
+---
+
+## 7. 场景选型：10 种卡片 + 同 type 内图片高度不齐
+
+### 现象对齐（实现层）
+
+| 体感 | 更吻合的版本 | 底层原因 |
+|---|---|---|
+| 快滑流畅，但虚白 / 整屏白 | **V1** | 靠 `estimatedItemSize` + 类型平均高估绝对坐标；同 type 高度方差大时，预渲染窗口算不准 → blank；滚动本身较少被同步测量堵住 |
+| 快滑卡顿、少白屏；列表很长时可能卡死/crash | **V2** | `useLayoutEffect` 里同步 `measureLayout`；图片异步撑开高度 → 反复 `modifyChildrenLayout` / 重渲染；空白少，但 JS 布局风暴会卡甚至拖垮 |
+
+`getItemType` **解决不了这个问题**。它只隔离回收池（10 种结构 → 10 个池），**不管高度**。同 type 高度参差是布局/测量问题，不是 type 划分问题。不要按「高度档位」拆 type（池会炸、回收变差）。
+
+### 结论：这类业务更该押 **V2**，但有前提
+
+1. **引擎匹配度**：不规则图片流本质是「高度事前不可用单一 estimate 描述」。V2 就是为去掉 estimate、按真实测量排版而重写的；V1 的 blank 在这种数据分布下是结构性的，不是调一下 `estimatedItemSize` 就能根治。
+2. **必须先稳住高度**：接口带上图片宽高或 aspect ratio，cell 用固定比例容器占位，图片加载后**不再改变 cell 高度**。否则：
+   - V1 → 白屏
+   - V2 → 卡顿 / 布局风暴 / crash  
+   两边都不会好。
+3. **若暂时拿不到尺寸**：短期体感上 V1「更跟手」、V2「更正确但更卡」；产品上整屏白通常比偶发卡顿更伤，但 V2 的 crash 不可接受。正确顺序是 **先做高度占位，再上 V2**，而不是在「裸图片撑开」状态下二选一硬扛。
+4. **Old Arch 只能 V1**：那时用 `overrideItemLayout` 尽可能写入已知 size，并把 `estimatedItemSize` 调到接近中位数，接受残余 blank。
+
+### 实践清单（V2 优先路径）
+
+- `getItemType` → 按 **10 种卡片结构** 分，不按高度分
+- 图片区：`aspectRatio` / 预知 height，避免 `onLoad` 改布局
+- item 组件 memo；回收用 `useRecyclingState`，禁止 cell 内 `key={item.id}`
+- 长列表仍卡：查图片解码/重布局次数，适当加大 `drawDistance`，避免一次插入过大
+- 只有 New Arch 可用时才上 V2.3.3

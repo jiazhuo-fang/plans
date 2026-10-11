@@ -281,14 +281,14 @@ V1 Android `AutoLayoutView.dispatchDraw` → `clearGapsAndOverlaps`；同时算 
 
 ## 7. 严谨场景分析：同 type 高度不齐 +「JS 精确预高」是否让 V1 更优
 
-### 7.1 体感对齐到版本（按机制）
+### 7.1 体感对齐到版本（以用户实测为准，名称锁定）
 
-| 体感 | 对齐版本 | 源码机制 |
+| 版本 | 用户实测体感 | 下文一律按此称呼 |
 |---|---|---|
-| 惯性跟手、快滑不堵 JS，但白屏率高 | **V1.8.3** | 滚动期主要靠事先算好的绝对坐标 + 小 `drawDistance` 预挂载；坐标/覆盖算错或挂载跟不上 → blank；**没有**每帧对全部 cell 做同步 `measureLayout` |
-| 快滑明显卡 / 短暂停住、白屏很少；极端时长列表可能卡死 | **V2.3.3** | 每个 layout 周期对 engaged `ViewHolder` 同步 `measureLayout`；尺寸一变就 `modifyChildrenLayout` → `setRenderId`；超过 40 次 render 未 commit 会告警并停止更新（`RenderTimeTracker`） |
+| **V1** | **卡顿为主，白屏少** | 不可与 V2 对调 |
+| **V2** | **滚动跟手、不怎么卡，白屏多** | 不可与 V1 对调 |
 
-「卡顿反而少白屏」在机制上成立：V2 卡顿把滚速压下来，窗口来得及测完；V1 滚速不降，窗口跑在渲染前面就空。
+说明：早期文档曾把「跟手+白屏」误标到 V1；**以本表为准**。机制解释必须能同时容纳这两条实测，而不是改写体感。
 
 ---
 
@@ -339,46 +339,36 @@ V1 写死 `forceNonDeterministicRendering`。RLV `ViewRenderer` 在该模式下�
 | size 准但 `renderItem` 很重 | 仍可能 blank（挂载跟不上惯性） |
 | size 与真实差几 px | 非确定性 relayout + AutoLayout 挪位 |
 
-**「后端 natural + UI 结构 JS 推算」正好打在 V1 blank 主因上。**
+精确 `size` 主要消灭的是 V1 的 **错位/乱 relayout/过绘失控**；按你的实测，V1 痛点是卡而非白，所以预高的收益首先是 **减卡**（少挂错人、少 relayout），不是「治 V2 那种白屏」。
 
 ---
 
-### 7.4 V2 卡顿因果链
+### 7.4 V2 与「白屏多、却不卡」如何同时成立
 
-`RecyclerView.tsx` 每个 `useLayoutEffect`：对全部 engaged ViewHolder 同步 `measureItemLayout` → `modifyChildrenLayout` → 变则 `setRenderId`，否则 commit + MVCP。
+`RecyclerView.tsx`：`onScroll` → 最多 `setRenderId`；真正 `measureLayout` 在随后的 `useLayoutEffect`。  
+原生滚动不等人 → 体感跟手；cell 未上树 → 白屏。高度不齐会加长「测不准/再 render」窗口，让白更久。  
+V2 **无法**用 `overrideItemLayout.size` 注入预高（API 已删）。
 
-- 图片先矮后撑 → 反复 measure/relayout → 卡；连续 40 次未 commit → 停止更新（像卡死）
-- 即使业务层把算出的 height 写死在 cell 根上，V2 **仍**每轮同步测量 engaged 集合；只是不再高度风暴
-- V2 **无法**把 JS 预高写进 layout manager 替代测量
+### 7.5 精确 JS 预高后怎么理解两边
 
----
+- **V1**：有 `layout.size` API；预高准 → 减过绘/减 relayout → 对症你实测的 **V1 卡顿**。  
+- **V2**：治白屏更靠「加快/减少补挂载滞后」（占位稳定、减轻 item、`drawDistance`、避免测量风暴），不是 V1 那条 size 注入。  
+- `getItemType`：两边都按 **结构** 分池；V1 均值是全局的，不是 per-type。
 
-### 7.5 结论：精确 JS 预高后，V1 是否更好？
+### 7.6 预高条件（V1 路径）
 
-**在你能把预高做到与真实渲染一致的前提下：是。V1 是这条策略的对口引擎；V2 关掉了 size 注入。**
+1. 每个 index 写 `layout.size`  
+2. 含图比例、显隐、padding/border、separator  
+3. Image 同一公式占位，禁止 `onLoad` 改高  
+4. 回调必须快；`getItemType` 按结构  
 
-1. API：V1 有 `size`；V2 文档与类型明确不读 size  
-2. 滚动热路径：V1 准 size 后主要是换池 + 渲染；V2 多全量 engaged 同步 measure  
-3. blank 主因（预堆叠偏大）可被逐项 `size` 消灭  
-4. `getItemType` 两边都要（结构分池）；不要误当成 V1 的「每 type 均值」——V1 均值是全局的；精确路径应逐项写 `size` 绕过它  
-5. V2 的 per-type 均值只是无估计时的 bootstrap，替补不了你的 JS 模型  
+### 7.7 决策表（体感已锁定）
 
-### 7.6 预高必须满足的条件
-
-1. 每个 index 写 `layout.size`（竖列表=高度）  
-2. 算式覆盖：图区比例、模块显隐、padding/border、**separator**  
-3. Image 按同一公式占位，禁止 `onLoad` 再改高  
-4. `overrideItemLayout` 必须快  
-5. `getItemType` 按 10 种**结构**，不按高度档  
-6. render 仍慢则加大 `drawDistance` 只能缓解  
-
-### 7.7 决策表（修订）
-
-| 能力 | 选择 |
+| 目标 | 方向 |
 |---|---|
-| 能拿到 natural 尺寸且 JS 高度≈真实 UI | **V1.8.3 + 逐项 `overrideItemLayout.size` + 结构 `getItemType`** |
-| 推算经常不准 | V1 白屏 / V2 卡顿都会出现——先修占位 |
-| 必须用 V2（MVCP/masonry/无原生等） | cell 根写死算出的 height；接受同步 measure；props memo |
+| 先压 V1 的卡 | 逐项准 `overrideItemLayout.size` + 结构 `getItemType` + 减轻 item |
+| 先压 V2 的白 | 稳定占位高度 + 减 item 成本 + 调 `drawDistance`；接受无 size 注入 |
+| 推算不准 | V1 更卡或乱跳；V2 白更久——先修占位 |
 
 ### 7.8 V1 精确预高清单
 
@@ -400,120 +390,44 @@ estimatedItemSize={medianOrSlightlySmall} // 仅兜底；目标很少走到
 
 ---
 
-### 8.1 V1 白屏：主因是「按错误身高选人」，不是原生画不动
+### 8.0 名称锁定（再强调）
 
-#### 链路（源码顺序）
+- **V1** = 卡顿为主、白屏少  
+- **V2** = 跟手不卡、白屏多  
 
-```
-原生 ScrollView 滚动 (UI 线程，通常不卡)
-    → JS onScroll
-    → RLV VirtualRenderer.updateOffset
-    → ViewabilityTracker._updateTrackingWindows
-         engaged = [offset - renderAhead, offset + viewport + renderAhead]
-    → 用 layouts[i].y / .height 做相交测试，算出 engagedIndexes
-         ↑ 这些 y/height 来自 estimatedItemSize 或全局 average，或 overrideItemLayout.size
-    → VirtualRenderer 更新 renderStack（从 RecycleItemPool 取 key）
-    → setState → 只 mount 这些 index 的 cell
-    → 非确定性模式：cell 只有 absolute top，真实高度由内容撑开
-    → AutoLayoutView.dispatchDraw：把已挂载的连续 cell 挪紧（清 gap）
-    → 若已挂载的人太少，挪紧后仍盖不满视口 → 用户看到白屏
-    → 稍后 onLayout → overrideLayout → relayout → 才可能补人
-```
+下面 8.1 起按引擎机制写「谁更容易白 / 谁更容易卡」；叙述时显式写 V1/V2，不再使用易混淆口语。
 
-关键代码：
+### 8.1 先对齐：为何 V1 更像「卡、少白」，V2 更像「滑、多白」
 
-- `ViewabilityTracker._updateTrackingWindows`：engaged 窗口 = 视口 ± `renderAheadOffset`（FlashList 默认约 250，渐进到 `finalRenderAheadOffset`）
-- `_checkIntersectionAndReport`：用 **`layouts[i]` 的估计坐标** 判断谁进窗口
-- FlashList 写死 `forceNonDeterministicRendering`；`ViewRenderer` 不设 height，只设 top
-- `AutoLayoutShadow.clearGapsAndOverlaps`：只重排**已经挂载**的 `CellContainer`；**不会**多 mount 新 index
-- `computeBlankFromGivenOffset`：用「已绘制像素上下界 vs 真实 scrollOffset」算 blank——这是**观测**，不是白屏的制造者
+两边都是「原生 ScrollView 在滑 + JS 决定挂哪些 cell」。体感差来自：**卡顿**往往是 JS 帧被拖死；**白屏**是视口里暂时没有 cell 节点。二者可以分离——原生滚动仍跟手时，JS 补 cell 慢，就会「不卡但白」。
 
-#### 估计偏大时为什么白屏特别狠（你的业务：同 type 图高参差 + 粗 estimate）
+#### V1（卡顿为主、白屏少）——源码侧更吻合的解释
 
-假设 `estimatedItemSize` / 全局平均 ≈ 400，真实很多卡只有 ≈ 120：
+1. **粗 `estimatedItemSize` 若整体偏小** → engaged **过绘**（挂过多复杂卡）→ JS render/回收重 → **卡**；视口却更不容易空 → **白屏少**。  
+2. **即便估计不准**：`AutoLayoutView` 在 `dispatchDraw` 里对**已挂载** cell 做 `clearGapsAndOverlaps`，视觉上先把缝抹掉，用户更少感到「镂空白」；代价是布局纠正 + 后续 `onLayout`/`overrideLayout` relayout，进一步吃 JS → 更卡。  
+3. 同 type 图高参差 → 全局 `AverageWindow` 失真 → 过绘/欠绘都可能；你当前 V1 体感落在 **过绘 + AutoLayout 补缝** 这一侧。
 
-1. Layout 以为 3 个 item 就能盖住一整屏 → engaged 只选很少 index  
-2. 这几个 cell 真实高度很小；AutoLayout 把它们挪紧后，视口下半截**根本没有节点**  
-3. 快滑时 offset 连续跳，relayout / 补人永远慢半拍 → 虚白甚至整屏白  
-4. 同 type 高度不一致通过 **全局 AverageWindow**（不是 per-type）把平均拉得更离谱，加重 1）
+#### V2（跟手不卡、白屏多）——源码侧更吻合的解释
 
-官方 `estimated-item-size.md` 原话等价于上述机制：estimate 偏大 → 列表以为画够了其实没画够。
+1. 滚动在 **原生 ScrollView**；`onScroll` 里最多 `setRenderId`，**不在滚动手势线程上同步画完所有 cell**。惯性可以一直跟手 → 体感 **不卡**。  
+2. cell 要等 React commit + `useLayoutEffect` 里 `measureLayout` 之后才稳定；快滑时「窗口已经滑走、新 ViewHolder 还没上树」→ **白屏**。  
+3. V2 **没有** AutoLayout 那层「把已挂的人挪满视口」；空就是空，白屏更刺眼。  
+4. 同 type 高度不齐主要放大 **补测/重排次数**（白屏持续时间、偶发卡死），不是 V1 那种「靠估计选人」模型；但快滑露白的第一卡点仍是 **JS 补挂载落后于原生滚动**。
 
-#### 三个假说在 V1 上的排序
+#### 三个假说（按你的实测重新排序）
 
-| 假说 | 是否主因 | 说明 |
+| 假说 | 对 V1（卡、少白） | 对 V2（滑、多白） |
 |---|---|---|
-| 同 type 高度不一致 → 尺寸预测失真 | **主因（逻辑根）** | 导致 `layouts[]` 坐标错 → engaged 选人过少 |
-| JS 引擎 / React 挂载跟不上 | **次因 / 放大器** | 估计准了仍可能因 item 太重、快滑来不及 mount；估计错时「该挂的没挂」先发生 |
-| 原生渲染瓶颈 | **基本不是** | Scroll 在原生继续；AutoLayout 只是挪已有 view + 报 blank；白屏是「没 node」不是「GPU 画不出」 |
+| 同 type 高度不一致 | 经全局平均扭曲 → 易过绘/乱 relayout → **助长卡** | 助长反复 measure；让空窗更久 |
+| JS 运行时开销 | **卡顿主因**（过绘 + AutoLayout/relayout） | **白屏主因**（commit/挂载跟不上滚速；滚动手势本身不堵） |
+| 原生渲染瓶颈 | 不是主因 | 不是主因（恰恰是原生滑得动、JS 填不满） |
 
----
+### 8.2 对照表（名称已按实测锁定）
 
-### 8.2 「粗估计却少白屏、反而卡」——和白屏是同一旋钮的另一端
-
-官方建议：两个值拿不准时选**更小**的 `estimatedItemSize`。
-
-| estimate | engaged 选人 | 视口覆盖 | 滚动体感 |
-|---|---|---|---|
-| **偏大** | 偏少 | 易白屏 | 跟手（JS 活少） |
-| **偏小**（含「瞎写但偏小」） | 偏多 | 白屏低 | **卡**（同一帧要 mount/update 更多复杂卡片） |
-| 接近真实中位数 / 逐项准 size | 合适 | 白屏低 | 相对跟手 |
-
-因此：若实测是「估计很粗 + 快滑卡 + 白屏很低」，在 V1 机制上通常对应 **估计整体偏小或被平均拉小 → 过绘（overdraw）**，卡点在 **JS 侧 render / 回收更新过多**，不是原生。  
-若实测是「跟手 + 白屏高」，通常对应 **估计偏大或方差导致等效偏大 → 欠绘（underdraw）**。
-
-两边都不是「原生画不动」；是 **用错误身高决定挂多少人** 的两种失败模式。
-
----
-
-### 8.3 V2 少白屏却卡：主因是同步测量 + 布局提交环，不是同 type 均值
-
-#### 链路
-
-```
-原生 ScrollView 滚动
-    → onScroll → VelocityTracker
-    → EngagedIndicesTracker.updateScrollOffset
-         可用 velocity 投影：offset' = offset + v * avgRenderTime
-         按滚动方向 0.3/0.7 分配 2*drawDistance 缓冲
-    → 用（已测量的）layouts 二分出 engaged
-    → RenderStackManager.sync → setRenderId
-    → React 渲染 ViewHolder
-    → useLayoutEffect：对每个 engaged ref 同步 measureLayout
-    → modifyChildrenLayout；若高度变了再 setRenderId
-    → 连续 40 次 render 未 commit → 停止更新（RenderTimeTracker）
-```
-
-同 type 高度不一致在 V2 上：
-
-- 主要触发 **反复 measure → relayout → 再 render**（卡顿 / 卡死），不是「选人过少」  
-- per-type `MultiTypeAverageWindow` 只影响**尚未测过**的 bootstrap；测过的用真值  
-
-快滑仍可能白屏的条件（次要）：
-
-- JS 一帧内来不及完成「scroll → setState → commit → 新 ViewHolder 上树」  
-- 投影 / `drawDistance` 不够抵消速度  
-- 这是 **JS/React 提交滞后**，仍不是原生 GPU
-
-首次 `opacity: 0` 直到 `commitLayout`（`ViewHolderCollection`）是防闪，不是快滑白屏主因。
-
-#### 三个假说在 V2 上的排序
-
-| 假说 | 是否主因 | 说明 |
+| | **V1：卡、少白** | **V2：滑、多白** |
 |---|---|---|
-| JS 运行时（同步 measure + 重渲染环） | **卡顿主因** | 热路径在 JS；40 次未 commit 会直接停更 |
-| 同 type 高度不一致 | **卡顿放大器** | 图片撑高 → 布局失效风暴；不是典型「欠绘白屏」根 |
-| 原生渲染 | **基本不是** | 无 AutoLayout；空白来自尚未 mount 的 JS 视图 |
+| 更贴合的机制 | 估计偏小/过绘 + AutoLayout 抹缝 + relayout 吃 JS | 原生滚得动；React 挂 cell 慢；无 AutoLayout 补缝 |
+| 用户首先感知 | 顿挫 / 短暂停住 | 镂空 / 整段白 |
+| 粗估计未精细干预时 | 与「卡、少白」相容（偏小或过绘路径） | 不依赖 `estimatedItemSize`；白来自补挂载滞后 |
 
----
-
-### 8.4 对照一句话
-
-| | V1 高白屏 | V1 低白屏却卡 | V2 低白屏却卡 |
-|---|---|---|---|
-| 核心机制 | `layouts` 估计偏大 → engaged **欠绘** | 估计偏小 → engaged **过绘** | 每轮同步 measure + 可能布局风暴 |
-| 卡点线程 | 决策在 JS；表现是「没挂节点」 | JS render 过重 | JS layout/render |
-| 原生角色 | 滚动照做；AutoLayout 挪已有 cell、报 blank | 同左 | 滚动照做 |
-| 与「同 type 高度差」关系 | 经**全局平均 / 粗 estimate** 扭曲坐标 → 欠绘 | 若平均被拉低则过绘 | 经**反复实测**制造卡顿 |
-
-**白屏的本质（V1 主路径）**：不是 GPU 瓶颈，而是 **虚拟化「该画谁」算错/算少了**——在你这种同 type 图片高度不齐、又只靠粗 `estimatedItemSize` 时，这个错误会被放大到快滑几乎必然露白。
+**一句话（按你的 V1/V2 体感）**：V1 的痛在 **JS 干太多（卡）**；V2 的痛在 **JS 补 cell 太慢而原生仍在滑（白）**——都不是 GPU 画不出来。

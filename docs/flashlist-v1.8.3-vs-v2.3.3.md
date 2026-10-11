@@ -386,7 +386,13 @@ estimatedItemSize={medianOrSlightlySmall} // 仅兜底；目标很少走到
 
 ## 8. 根因深挖：快滑白屏 / 卡顿到底卡在哪
 
-本节只回答「为什么」，不给选型口号。白屏在两边的物理含义相同：**可见视口里没有（足够的）已挂载 cell 视图覆盖像素**。原生 ScrollView 仍在滑；缺的是 JS 决定挂载的那批 React 节点。
+> **以实测锁定为准的完整源码追因**（事实 / 推断分开写）见：  
+> [`flashlist-symptom-rootcause-v1-v2.md`](./flashlist-symptom-rootcause-v1-v2.md)  
+> **V1 = 卡、少白；V2 = 滑、多白。** 勿对调。
+
+本节旧文仅作摘要；若与上篇冲突，以上篇为准。
+
+白屏物理含义：**可见视口里没有（足够的）已挂载 cell 覆盖像素**。原生 ScrollView 仍可在滑。
 
 ---
 
